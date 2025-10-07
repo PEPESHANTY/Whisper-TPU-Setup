@@ -1,3 +1,6 @@
+
+
+
 # Whisper-TPU-Setup
 
 # Whisper-JAX (TPU) — Reproducible Setup Guide
@@ -235,3 +238,222 @@ Then tunnel port **7860** to your laptop and open `http://localhost:7860/docs`.
 - `transformers==4.41.1`, `tokenizers==0.19.1`, `huggingface-hub==0.23.0`, `safetensors==0.4.2`
 - `librosa==0.10.2.post1`, `soundfile==0.13.1`, `soxr>=0.3.2`
 - `cached-property==1.5.2`
+
+
+
+## Usage & Operations Cheatsheet
+
+### Log in & jump to the project
+```bash
+cd ../..
+cd /mnt/node5_tpu_data_code_1/whisper
+source whisper-venv/bin/activate
+```
+
+### Start Whisper (single TPU, localhost only)
+```bash
+# choose ONE chip (0..3). Do this in the SAME shell before starting uvicorn.
+export PJRT_DEVICE=TPU
+export TPU_VISIBLE_DEVICES=0
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+unset JAX_PLATFORMS   # important: prevents HF/Flax CPU-backend error
+
+# run the API (don’t use --limit-concurrency here)
+uvicorn serve_whisper:app --host 127.0.0.1 --port 7860 --workers 1
+```
+
+Health check (on the TPU):
+```bash
+curl -s http://127.0.0.1:7860/health || curl -s http://127.0.0.1:7860
+```
+
+### SSH tunneling from your laptop
+> Example only — **replace** user/IP with yours.
+
+```bash
+ssh -NT -4 -o ExitOnForwardFailure=yes -o ServerAliveInterval=60 \
+  -i "C:\Users\you\.ssh\my-tpu-key" \
+  -L 7860:127.0.0.1:7860 you@203.0.113.10
+# then open http://127.0.0.1:7860 (or /docs)
+```
+If port 7860 is busy locally, pick another: `-L 8786:127.0.0.1:7860` → visit `http://127.0.0.1:8786`.
+
+### See which TPU chips are in use
+```bash
+sudo fuser -v /dev/accel*
+```
+You’ll see holders of `/dev/accel0..3` with PIDs and command names.
+
+### Free a stuck TPU process (example PID: 2928424)
+```bash
+ps -fp 2928424
+sudo kill -15 2928424; sleep 5 || true
+sudo kill -9 2928424   # if it didn’t exit
+
+# verify TPU backend comes up
+python - <<'PY'
+import jax
+print("Backend:", jax.default_backend())
+print("Devices:", jax.devices())
+PY
+```
+
+### Verify your “single-TPU” env actually applied
+```bash
+python - <<'PY'
+import os, jax
+print("TPU_VISIBLE_DEVICES =", os.environ.get("TPU_VISIBLE_DEVICES"))
+print("backend:", jax.default_backend())
+print("devices:", jax.devices())
+print("local_device_count:", jax.local_device_count())
+PY
+# Expect: TPU_VISIBLE_DEVICES=0, backend=tpu, local_device_count=1
+```
+
+### Quick client test (from your laptop, via the tunnel)
+```bash
+curl -s http://127.0.0.1:7860/transcribe \
+  -F 'file=@english_sample.wav;type=audio/wav' \
+  -F 'task=transcribe' -F 'return_timestamps=false'
+```
+
+### Optional: run in tmux (keeps it alive after you disconnect)
+```bash
+tmux new -s whisper -d 'bash -lc "
+cd /mnt/node5_tpu_data_code_1/whisper &&
+source whisper-venv/bin/activate &&
+export PJRT_DEVICE=TPU &&
+export TPU_VISIBLE_DEVICES=0 &&
+export XLA_PYTHON_CLIENT_PREALLOCATE=false &&
+unset JAX_PLATFORMS &&
+uvicorn serve_whisper:app --host 127.0.0.1 --port 7860 --workers 1
+"'
+tmux attach -t whisper   # view logs
+# tmux detach:  Ctrl+b then d
+# stop: inside tmux press Ctrl+C, or: tmux kill-session -t whisper
+```
+
+# Whisper‑JAX on TPU — Pin to **One** TPU Chip
+
+This mini‑guide shows exactly how to make a Whisper‑JAX service use **one** TPU chip (out of 4) instead of all chips on a TPU VM.
+
+> Works for Uvicorn/FastAPI servers like `serve_whisper.py` and other JAX programs.
+
+---
+
+## 1) Pick a single chip with env vars
+
+Run these **in the same shell** you will start Uvicorn from (before any JAX import):
+
+```bash
+export PJRT_DEVICE=TPU
+export TPU_VISIBLE_DEVICES=0        # choose 0..3 for accel0..accel3
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+unset JAX_PLATFORMS                  # important: don't force 'tpu' only
+```
+
+Start your server (bound to loopback for safety):
+```bash
+uvicorn serve_whisper:app --host 127.0.0.1 --port 7860 --workers 1
+```
+
+> `--workers` and `--limit-concurrency` control HTTP requests, **not** TPU selection. The device selection happens only via `TPU_VISIBLE_DEVICES`.
+
+---
+
+## 2) Verify it really uses just one chip
+
+```bash
+python - <<'PY'
+import os, jax
+print("TPU_VISIBLE_DEVICES =", os.environ.get("TPU_VISIBLE_DEVICES"))
+print("backend:", jax.default_backend())
+print("devices:", jax.devices())
+print("local_device_count:", jax.local_device_count())
+PY
+```
+Expected:
+```
+TPU_VISIBLE_DEVICES = 0
+backend: tpu
+local_device_count: 1
+```
+
+---
+
+## 3) Make it foolproof (set in code too)
+
+Put this at the **top** of `serve_whisper.py` (before importing JAX/whisper/transformers):
+
+```python
+import os
+os.environ.setdefault("PJRT_DEVICE", "TPU")
+os.environ.setdefault("TPU_VISIBLE_DEVICES", "0")       # choose 0..3
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+# Do NOT set JAX_PLATFORMS here (HF/Flax may briefly query CPU backend)
+```
+
+---
+
+## 4) Run multiple isolated servers (optional)
+
+Pin each process to a different chip:
+
+```bash
+# chip 0 on port 7860
+TPU_VISIBLE_DEVICES=0 uvicorn serve_whisper:app --host 127.0.0.1 --port 7860 --workers 1
+
+# chip 1 on port 7861 (another shell/tmux)
+TPU_VISIBLE_DEVICES=1 uvicorn serve_whisper:app --host 127.0.0.1 --port 7861 --workers 1
+```
+
+---
+
+## 5) Ops helpers
+
+**See which processes are using the chips:**
+```bash
+sudo fuser -v /dev/accel*
+```
+
+**Free a stuck process (example PID: 2928424):**
+```bash
+ps -fp 2928424
+sudo kill -15 2928424; sleep 5 || true
+sudo kill -9 2928424   # if needed
+```
+
+**Run under tmux so it keeps running after logout:**
+```bash
+tmux new -s whisper -d 'bash -lc "
+export PJRT_DEVICE=TPU &&
+export TPU_VISIBLE_DEVICES=0 &&
+export XLA_PYTHON_CLIENT_PREALLOCATE=false &&
+unset JAX_PLATFORMS &&
+cd /mnt/node5_tpu_data_code_1/whisper &&
+source whisper-venv/bin/activate &&
+uvicorn serve_whisper:app --host 127.0.0.1 --port 7860 --workers 1
+"'
+tmux attach -t whisper   # view logs; detach: Ctrl+b then d
+```
+
+---
+
+## 6) Common pitfalls
+
+- **Setting `JAX_PLATFORMS=tpu`** → breaks HF/Flax init (they briefly query CPU backend). Leave it **unset**.
+- **Setting env vars in a different shell** → JAX enumerates all devices. Export them **in the same shell/process** that starts Uvicorn.
+- **Using `--limit-concurrency 1`** → can reject `/health` & parallel calls with 503. Prefer an app‑level mutex if you truly need single‑flight on `/transcribe`:
+
+```python
+import asyncio
+transcribe_lock = asyncio.Lock()
+
+@app.post("/transcribe")
+async def transcribe(...):
+    async with transcribe_lock:
+        # do the work
+        ...
+```
+
+That’s all—you’re now running Whisper‑JAX on **one** TPU chip, reliably.
