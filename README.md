@@ -649,6 +649,66 @@ curl -s http://127.0.0.1:9000/health
 | Service dies on logout | Running uvicorn manually | Moved to `systemd` daemon |
 | Backend shows CPU | TPU env not exported | Set `PJRT_DEVICE=TPU` and install `jax[tpu]` |
 
+## 5. B Troubleshooting (Detailed)
+
+### A) “Bad unit file” or `status=203/EXEC`
+Fix malformed ExecStart:
+```bash
+ExecStart=/bin/bash -lc 'exec /path/to/venv/bin/python -m uvicorn serve_whisper:app --host "$HOST" --port "$PORT" --workers 1'
+sudo sed -i 's/\r$//' /etc/systemd/system/whisper.service /etc/default/whisper
+sudo systemctl daemon-reload && sudo systemctl restart whisper
+```
+
+### B) `tokenizers>=0.22.0,<=0.23.0 required but found 0.19.1`
+You’re mixing incompatible versions.  
+Reinstall with compatible set:
+```bash
+pip install --no-cache-dir --no-deps   "transformers==4.41.1" "tokenizers==0.19.1" "huggingface-hub==0.23.0" "safetensors==0.4.2"
+```
+
+### C) “backend”: “cpu” instead of “tpu”
+Add to `/etc/default/whisper`:
+```
+PJRT_DEVICE=TPU
+TPU_VISIBLE_DEVICES=0
+XLA_PYTHON_CLIENT_PREALLOCATE=false
+```
+Then reinstall TPU JAX and restart:
+```bash
+pip install --no-cache-dir --force-reinstall "jax[tpu]==0.4.31" "jaxlib==0.4.31" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+sudo systemctl restart whisper
+```
+
+### D) Port already in use
+```bash
+sudo fuser -k 9000/tcp
+sudo systemctl restart whisper
+```
+
+### E) Nothing responds on port 9000
+```bash
+journalctl -u whisper -n 200 --no-pager
+# Look for Python tracebacks
+```
+
+### F) Check environment inside running service
+```bash
+PID=$(systemctl show -p MainPID --value whisper)
+tr '\0' '\n' < /proc/$PID/environ | egrep 'HOST|PORT|MODEL|TPU'
+```
+
+---
+
+## Verification Commands
+
+```bash
+systemctl status whisper --no-pager
+journalctl -u whisper -n 100 --no-pager
+sudo ss -lntp | grep :9000
+curl -s http://127.0.0.1:9000/health
+```
+
+
 ---
 
 ## 6. Validation
