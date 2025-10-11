@@ -457,3 +457,229 @@ async def transcribe(...):
 ```
 
 That’s all—you’re now running Whisper‑JAX on **one** TPU chip, reliably.
+
+# Process of Whisper-JAX (Whisper-large-v3) — Persistent TPU/CPU Service
+
+
+# Whisper-JAX Persistent TPU/CPU Service Setup
+
+## Overview
+
+This guide explains how we successfully deployed **Whisper-JAX (openai/whisper-large-v3)** as a **persistent FastAPI service** running on **TPU or CPU**, using `systemd` for reliability.  
+It documents all dependency conflicts, fixes, and configuration steps to make the setup run indefinitely and restart automatically.
+
+---
+
+## 0. Environment Setup
+
+**Location:** `/mnt/node5_tpu_data_code_1/whisper`  
+**Virtualenv:** `/mnt/node5_tpu_data_code_1/whisper/whisper-venv`  
+**Python:** 3.10
+
+```bash
+mkdir -p /mnt/node5_tpu_data_code_1/whisper
+python3 -m venv /mnt/node5_tpu_data_code_1/whisper/whisper-venv
+source /mnt/node5_tpu_data_code_1/whisper/whisper-venv/bin/activate
+python -m pip install --upgrade pip wheel setuptools
+```
+
+> (Optional) Install TPU-compatible JAX:
+```bash
+pip install --no-cache-dir --force-reinstall "jax[tpu]==0.4.31" "jaxlib==0.4.31"     -f https://storage.googleapis.com/jax-releases/libtpu_releases.html
+```
+
+---
+
+## 1. Stable Working Versions
+
+We used a **manually pinned version set** to avoid HuggingFace dependency conflicts:
+
+```bash
+export PYTHONNOUSERSITE=1
+
+pip uninstall -y transformers tokenizers huggingface-hub safetensors whisper-jax || true
+
+pip install --no-cache-dir --no-deps   "transformers==4.41.1"   "tokenizers==0.19.1"   "huggingface-hub==0.23.0"   "safetensors==0.4.2"
+
+pip install --no-cache-dir --no-deps   "git+https://github.com/sanchit-gandhi/whisper-jax.git@f983178"   "cached-property==1.5.2"
+```
+
+### Why these versions?
+- Compatible with `whisper-jax` commit `f983178`
+- Avoids the tokenizers `>=0.22` enforcement from newer Transformers
+- Stable on both TPU and CPU
+
+---
+
+## 2. Environment Isolation
+
+We removed `vllm_installation` from `sys.path` to prevent importing wrong Transformers versions.
+
+```bash
+SITE="/mnt/node5_tpu_data_code_1/whisper/whisper-venv/lib/python3.10/site-packages"
+cat > "$SITE/sitecustomize.py" <<'PY'
+import sys
+sys.path = [p for p in sys.path if "vllm_installation" not in p]
+PY
+```
+
+Sanity check:
+```bash
+python - <<'PY'
+import transformers, tokenizers, sys
+print(transformers.__version__, tokenizers.__version__)
+print("vllm path present?", any("vllm_installation" in p for p in sys.path))
+PY
+```
+
+---
+
+## 3. FastAPI Server
+
+**File:** `/mnt/node5_tpu_data_code_1/whisper/serve_whisper.py`
+
+```python
+import os, time, tempfile, sys
+sys.path = [p for p in sys.path if "vllm_installation" not in p]
+
+from fastapi import FastAPI, UploadFile, File, Form
+from fastapi.responses import JSONResponse
+import jax, jax.numpy as jnp
+
+try:
+    from whisper_jax import FlaxWhisperPipline as Pipeline
+except ImportError:
+    from whisper_jax import FlaxWhisperPipeline as Pipeline
+
+MODEL_ID = os.getenv("MODEL_ID", "openai/whisper-large-v3")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
+
+app = FastAPI(title="Whisper-JAX TPU Service")
+
+_pipe = None
+def get_pipe():
+    global _pipe
+    if _pipe is None:
+        _pipe = Pipeline(MODEL_ID, dtype=jnp.bfloat16, batch_size=BATCH_SIZE)
+    return _pipe
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "jax": jax.__version__,
+        "backend": jax.default_backend(),
+        "devices": len(jax.devices()),
+        "model_id": MODEL_ID,
+        "batch_size": BATCH_SIZE
+    }
+
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...), task: str = Form("transcribe")):
+    suffix = os.path.splitext(file.filename or "")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(await file.read())
+        tmp_path = tmp.name
+    t0 = time.time()
+    try:
+        out = get_pipe()(tmp_path, task=task)
+    finally:
+        os.remove(tmp_path)
+    return JSONResponse({"text": out["text"], "seconds": round(time.time() - t0, 3)})
+```
+
+Install server deps:
+```bash
+pip install fastapi "uvicorn[standard]" python-multipart
+```
+
+---
+
+## 4. Systemd Configuration
+
+**File:** `/etc/default/whisper`
+```bash
+WHISPER_HOME=/mnt/node5_tpu_data_code_1/whisper
+VENV=/mnt/node5_tpu_data_code_1/whisper/whisper-venv
+HOST=0.0.0.0
+PORT=9000
+MODEL_ID=openai/whisper-large-v3
+BATCH_SIZE=8
+PYTHONNOUSERSITE=1
+```
+
+**File:** `/etc/systemd/system/whisper.service`
+```bash
+[Unit]
+Description=Whisper-JAX TPU API (uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shantanu_tpu
+WorkingDirectory=/mnt/node5_tpu_data_code_1/whisper
+EnvironmentFile=/etc/default/whisper
+ExecStart=/bin/bash -lc 'exec /mnt/node5_tpu_data_code_1/whisper/whisper-venv/bin/python -m uvicorn serve_whisper:app --host "$HOST" --port "$PORT" --workers 1'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable + start:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable whisper
+sudo systemctl restart whisper
+curl -s http://127.0.0.1:9000/health
+```
+
+---
+
+## 5. Troubleshooting Summary
+
+| Issue | Cause | Fix |
+|-------|--------|-----|
+| Port already in use | Nginx running on 8000 | Stop nginx or switch to port 9000 |
+| systemd “bad unit file” | Broken ExecStart line | Use explicit full Python path |
+| tokenizers version error | Imported from wrong site-packages | Added `sitecustomize.py` cleanup |
+| Transformers conflict | Huggingface-hub pin mismatch | Manually pinned compatible versions |
+| Service dies on logout | Running uvicorn manually | Moved to `systemd` daemon |
+| Backend shows CPU | TPU env not exported | Set `PJRT_DEVICE=TPU` and install `jax[tpu]` |
+
+---
+
+## 6. Validation
+
+```bash
+curl -s http://127.0.0.1:9000/health
+# {"status":"ok","jax":"0.4.31","backend":"cpu","devices":1,"model_id":"openai/whisper-large-v3","batch_size":8}
+```
+
+Persistent service ✅  
+Correct dependency stack ✅  
+Survives reboots ✅  
+No tokenizers conflict ✅  
+
+---
+
+## 7. Quick Recreate Script
+
+```bash
+python3 -m venv /mnt/node5_tpu_data_code_1/whisper/whisper-venv
+source /mnt/node5_tpu_data_code_1/whisper/whisper-venv/bin/activate
+pip install --upgrade pip setuptools wheel
+
+pip install --no-cache-dir --no-deps   "transformers==4.41.1" "tokenizers==0.19.1" "huggingface-hub==0.23.0" "safetensors==0.4.2"
+pip install --no-cache-dir --no-deps   "git+https://github.com/sanchit-gandhi/whisper-jax.git@f983178" "cached-property==1.5.2"
+pip install fastapi "uvicorn[standard]" python-multipart
+```
+
+---
+
+✅ **Final Result:**  
+The service is now **production-stable**, automatically restarts, isolates dependencies, and exposes `/health` and `/transcribe` endpoints indefinitely.
+
+
